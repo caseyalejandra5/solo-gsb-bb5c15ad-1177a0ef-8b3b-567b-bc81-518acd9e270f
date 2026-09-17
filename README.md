@@ -105,6 +105,23 @@ curl -s -X DELETE localhost:8000/jobs/{id}
 - **cancelled**：幂等，再次取消返回 `200`；
 - **succeeded / failed**：终态受保护，返回 `409`，原结果不会被覆盖。
 
+#### 取消与完成的线性化语义
+
+对 running 作业，`DELETE` 与 worker 的写回由两条 `BEGIN IMMEDIATE` 事务按
+**提交顺序**线性化，取消优先级完全在 `JobStore` 的单次终结事务内裁决，作业外
+不做任何预检决策，因此不存在“检查时未取消、提交时已取消”的窗口：
+
+- **取消先提交**（作业仍为 running 时 `cancel_requested=1` 已落盘）：即使解析器
+  刚通过最后一次候选边界取消检查、worker 随后仍提交了成功结果或失败结果，终结
+  事务也会在同一事务里把终态原子地写为 `cancelled`，并把 `response`、
+  `response_status`、`error` 三列一并置空——已取消的作业永远观察不到任何结果或
+  错误；`attempts`（已求值候选数）仍可保留。
+- **完成先提交**：作业已为 `succeeded`/`failed` 后，后续 `DELETE` 返回 `409`，
+  结果原样保留（即上文既有行为）。
+
+两种交错顺序都有确定性并发测试覆盖：用线程事件把一方固定在“对方已提交之后”再
+继续，不依赖 sleep 或时序运气。
+
 ### 崩溃恢复
 
 worker 以单条 `BEGIN IMMEDIATE` 事务原子领取最早的 `queued` 作业（按入队顺序，

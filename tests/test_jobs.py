@@ -219,10 +219,13 @@ def test_terminal_state_cannot_be_overwritten_by_worker_finalize(tmp_path):
     assert store.request_cancel(jid) == "cancelled"
     # finalize only transitions running rows; a cancelled queued row is a
     # terminal state the worker cannot overwrite with a result.
-    store.finalize(jid, cancelled=False, response={"ok": 1}, response_status=200)
+    written = store.finalize(jid, response={"ok": 1}, response_status=200)
+    assert written is None
     job = store.get(jid)
     assert job["status"] == "cancelled"
     assert job["response"] is None
+    assert job["response_status"] is None
+    assert job["error"] is None
     assert job["finished_at"] is not None
     store.close()
 
@@ -236,10 +239,261 @@ def test_request_cancel_running_race_after_claim_returns_running(tmp_path):
     job = store.get(jid)
     assert job["status"] == RUNNING
     assert job["cancel_requested"] is True
-    # Cooperative stop honours the flag at finalize.
-    assert store.finalize(jid, cancelled=True, attempts=42)
+    # The store, not the caller, decides cancellation inside the finalize
+    # transaction from the persisted flag.
+    assert store.finalize(jid, attempts=42) == "cancelled"
     assert store.get(jid)["status"] == "cancelled"
     assert store.get(jid)["attempts"] == 42
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# Deterministic cancel/finish interleaving tests.
+#
+# Both racy orders are pinned with threading.Event instead of sleeps: the two
+# sides run on real threads against two JobStore instances (two SQLite
+# connections, as the API and the worker are), and one side blocks on an
+# event until the other side has *committed*, fixing the linearisation point.
+# ---------------------------------------------------------------------------
+
+
+def _claimed_store(path):
+    store = JobStore(path)
+    jid = store.enqueue(SIMPLE)["id"]
+    assert store.claim_next()["status"] == RUNNING
+    return store, jid
+
+
+def test_cancel_committed_first_forces_cancelled_with_no_result(tmp_path):
+    """DELETE commits cancel_requested=1 while running; the worker then
+    submits a successful result anyway. The finalize transaction must
+    observe the flag and atomically write cancelled with all result
+    columns NULL."""
+    import threading
+
+    path = str(tmp_path / "cancel_first.db")
+    worker, jid = _claimed_store(path)
+    api = JobStore(path)
+    outcome: dict = {}
+    cancel_committed = threading.Event()
+
+    def cancel_side():
+        outcome["cancel"] = api.request_cancel(jid)
+        cancel_committed.set()
+
+    def finish_side():
+        assert cancel_committed.wait(timeout=5)
+        outcome["finish"] = worker.finalize(
+            jid,
+            response={"status": "ok", "resolved": {"x": "2.0"}},
+            response_status=200,
+            attempts=7,
+        )
+
+    t1 = threading.Thread(target=cancel_side)
+    t2 = threading.Thread(target=finish_side)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+    assert not t1.is_alive() and not t2.is_alive()
+
+    assert outcome["cancel"] == RUNNING  # DELETE answered 202
+    assert outcome["finish"] == "cancelled"
+    job = api.get(jid)
+    assert job["status"] == "cancelled"
+    assert job["cancel_requested"] is True
+    assert job["response"] is None
+    assert job["response_status"] is None
+    assert job["error"] is None
+    # Cancellation may still record how far the search got.
+    assert job["attempts"] == 7
+    assert job["finished_at"] is not None
+    # A later DELETE is the idempotent 200 path, not a resurrection.
+    assert api.request_cancel(jid) == "cancelled"
+    worker.close()
+    api.close()
+
+
+def test_cancel_committed_first_forces_cancelled_with_no_error(tmp_path):
+    """Same interleaving, but the worker submits a *failed* result. The
+    error must be discarded together with any response columns."""
+    import threading
+
+    path = str(tmp_path / "cancel_first_fail.db")
+    worker, jid = _claimed_store(path)
+    api = JobStore(path)
+    outcome: dict = {}
+    cancel_committed = threading.Event()
+
+    def cancel_side():
+        outcome["cancel"] = api.request_cancel(jid)
+        cancel_committed.set()
+
+    def finish_side():
+        assert cancel_committed.wait(timeout=5)
+        outcome["finish"] = worker.finalize(
+            jid,
+            response={"status": "ok"},
+            response_status=200,
+            error={"code": "internal_error", "message": "boom"},
+            attempts=3,
+        )
+
+    t1 = threading.Thread(target=cancel_side)
+    t2 = threading.Thread(target=finish_side)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert outcome["cancel"] == RUNNING
+    assert outcome["finish"] == "cancelled"
+    job = api.get(jid)
+    assert job["status"] == "cancelled"
+    assert job["response"] is None
+    assert job["response_status"] is None
+    assert job["error"] is None
+    assert job["attempts"] == 3
+    worker.close()
+    api.close()
+
+
+def test_finish_committed_first_later_delete_is_terminal_409(tmp_path):
+    """The worker's terminal state commits first; the later DELETE must
+    observe the terminal status (the API maps that to 409) and the result
+    must be preserved verbatim."""
+    import threading
+
+    path = str(tmp_path / "finish_first.db")
+    worker, jid = _claimed_store(path)
+    api = JobStore(path)
+    outcome: dict = {}
+    finish_committed = threading.Event()
+
+    def finish_side():
+        outcome["finish"] = worker.finalize(
+            jid,
+            response={"status": "ok", "resolved": {"x": "2.0"}},
+            response_status=200,
+            attempts=1,
+        )
+        finish_committed.set()
+
+    def cancel_side():
+        assert finish_committed.wait(timeout=5)
+        outcome["cancel"] = api.request_cancel(jid)
+
+    t1 = threading.Thread(target=finish_side)
+    t2 = threading.Thread(target=cancel_side)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert outcome["finish"] == "succeeded"
+    # This is exactly the predicate the DELETE endpoint maps to HTTP 409.
+    assert outcome["cancel"] == "succeeded"
+    job = api.get(jid)
+    assert job["status"] == "succeeded"
+    assert job["response"] == {"status": "ok", "resolved": {"x": "2.0"}}
+    assert job["response_status"] == 200
+    assert job["error"] is None
+    worker.close()
+    api.close()
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        # worker submits a success after its last cancel boundary check
+        ({"status": "ok", "resolved": {"x": "2.0"}}, 200, None, 1),
+        # worker submits a failure after its last cancel boundary check
+        ({"error": {"code": "internal_error", "message": "boom"}}, 500,
+         {"code": "internal_error", "message": "boom"}, 2),
+    ],
+)
+def test_worker_cancel_after_last_boundary_check_wins_over_submitted_result(
+    tmp_path, result
+):
+    """End-to-end through the real JobWorker: the resolver passes its final
+    ``should_cancel()`` boundary check, DELETE then commits
+    cancel_requested=1 while the job is running, and the runner returns
+    success/failure regardless. The persisted terminal state must be
+    cancelled with no response/response_status/error."""
+    import threading
+
+    from app.jobs import JobWorker
+
+    store = JobStore(str(tmp_path / "worker_race.db"))
+    at_last_check = threading.Event()
+    proceed = threading.Event()
+    observed: dict = {}
+
+    def runner(_payload, should_cancel):
+        # The very last cooperative check before returning: not cancelled.
+        observed["checked"] = should_cancel()
+        at_last_check.set()
+        # Block until DELETE has committed its flag, then submit the result.
+        assert proceed.wait(timeout=5)
+        return result
+
+    worker = JobWorker(store, runner)
+    jid = store.enqueue(SIMPLE)["id"]
+    worker.start()
+    try:
+        assert at_last_check.wait(timeout=5)
+        assert observed["checked"] is False
+        # DELETE lands strictly after the last check and before finalize.
+        assert store.request_cancel(jid) == RUNNING
+        assert store.get(jid)["cancel_requested"] is True
+        proceed.set()
+    finally:
+        proceed.set()
+        worker.stop()
+        store.close()
+
+    # Reopen to also prove the terminal state is what got persisted.
+    checker = JobStore(str(tmp_path / "worker_race.db"))
+    try:
+        job = checker.get(jid)
+        assert job["status"] == "cancelled"
+        assert job["response"] is None
+        assert job["response_status"] is None
+        assert job["error"] is None
+        assert job["attempts"] == result[3]
+        assert job["finished_at"] is not None
+    finally:
+        checker.close()
+
+
+def test_worker_finish_first_then_delete_preserves_result(tmp_path):
+    """End-to-end through the real JobWorker._process for the opposite
+    order: the runner returns, finalize commits succeeded, and the later
+    cancel request reports the terminal status (API => 409) with the result
+    preserved.  ``_process`` is synchronous, so the order is pinned without
+    any thread or sleep."""
+    from app.jobs import JobWorker
+
+    store = JobStore(str(tmp_path / "worker_finish_first.db"))
+
+    def runner(_payload, should_cancel):
+        assert should_cancel() is False
+        return {"status": "ok", "resolved": {"x": "2.0"}}, 200, None, 1
+
+    worker = JobWorker(store, runner)
+    jid = store.enqueue(SIMPLE)["id"]
+    claimed = store.claim_next()
+    assert claimed["status"] == RUNNING
+    # No DELETE before/during the run: the terminal state commits first.
+    worker._process(claimed)
+    assert store.get_status(jid) == "succeeded"
+    assert store.request_cancel(jid) == "succeeded"
+    job = store.get(jid)
+    assert job["status"] == "succeeded"
+    assert job["response"]["resolved"] == {"x": "2.0"}
+    assert job["response_status"] == 200
+    assert job["error"] is None
     store.close()
 
 

@@ -12,6 +12,24 @@ Job lifecycle::
 state transition is a conditional UPDATE, so a terminal row can never be
 overwritten.
 
+Linearised cancellation
+-----------------------
+
+``DELETE`` while a job is ``running`` and the worker's completion are
+linearised by **commit order** of two ``BEGIN IMMEDIATE`` transactions:
+
+* if the cancel request is committed first, the worker's finalising
+  transaction observes ``cancel_requested = 1`` and atomically writes
+  ``cancelled`` -- with ``response``, ``response_status`` and ``error``
+  forced to NULL -- even if the resolver had already passed its last
+  cooperative cancel check and hands a successful or failed result to the
+  store;
+* if the worker's terminal state is committed first, ``DELETE`` observes
+  ``succeeded``/``failed`` and leaves the row untouched (HTTP 409).
+
+The decision and the write happen in the same transaction; nothing is read
+before opening it.
+
 On startup, jobs left in ``running`` by a process that died (or was killed)
 are returned to ``queued``; stale ``cancel_requested`` rows are finalised as
 ``cancelled`` immediately instead.
@@ -147,45 +165,60 @@ class JobStore:
 
         * queued -> cancelled immediately (DELETE semantics)
         * running -> stays running with cancel_requested=1; the worker
-          stops at the next candidate-evaluation boundary
+          stops at the next candidate-evaluation boundary, or its finalising
+          transaction sees the flag and writes cancelled atomically
         * cancelled -> cancelled (idempotent)
         * succeeded/failed -> unchanged terminal state
-        """
-        with self._lock, self._conn:
-            row = self._conn.execute(
-                "SELECT status, cancel_requested FROM jobs WHERE id = ?",
-                (job_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            status = row["status"]
-            if status in (SUCCEEDED, FAILED):
-                return status
-            if status == CANCELLED:
-                return CANCELLED
-            if status == QUEUED:
-                cur = self._conn.execute(
-                    "UPDATE jobs SET status = ?, cancel_requested = 1, finished_at = ?"
-                    " WHERE id = ? AND status = ?",
-                    (CANCELLED, _utcnow(), job_id, QUEUED),
-                )
-                if cur.rowcount == 0:
-                    # Lost a race with the worker claiming the job; fall
-                    # through and merely flag it.
-                    self._flag_cancel(job_id)
-                else:
-                    self._fire_cancel_event(job_id)
-                    self._cancel_events.pop(job_id, None)
-                    return CANCELLED
-            else:  # running
-                self._flag_cancel(job_id)
-            return self.get_status(job_id)
 
-    def _flag_cancel(self, job_id: str) -> None:
-        self._conn.execute(
-            "UPDATE jobs SET cancel_requested = 1 WHERE id = ?", (job_id,)
-        )
+        The read of the current state and every write happen in one
+        ``BEGIN IMMEDIATE`` transaction, so this call is one of the two
+        linearisation points racing with :meth:`finalize`: whichever
+        transaction commits first fixes the outcome.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT status, cancel_requested FROM jobs WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+                if row is None:
+                    self._conn.execute("COMMIT")
+                    return None
+                status = row["status"]
+                if status in (SUCCEEDED, FAILED):
+                    # Terminal state committed first: preserve it so the
+                    # API answers 409.
+                    self._conn.execute("COMMIT")
+                    return status
+                if status == CANCELLED:
+                    self._conn.execute("COMMIT")
+                    return CANCELLED
+                finished_at = _utcnow()
+                if status == QUEUED:
+                    self._conn.execute(
+                        "UPDATE jobs SET status = ?, cancel_requested = 1,"
+                        " finished_at = ? WHERE id = ? AND status = ?",
+                        (CANCELLED, finished_at, job_id, QUEUED),
+                    )
+                    became_terminal = True
+                else:  # running: persist the flag; the finalise txn decides
+                    self._conn.execute(
+                        "UPDATE jobs SET cancel_requested = 1"
+                        " WHERE id = ? AND status = ?",
+                        (job_id, RUNNING),
+                    )
+                    became_terminal = False
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        # Wake the in-process worker after the durable commit.
         self._fire_cancel_event(job_id)
+        if became_terminal:
+            self._cancel_events.pop(job_id, None)
+            return CANCELLED
+        return self.get_status(job_id)
 
     def _fire_cancel_event(self, job_id: str) -> None:
         event = self._cancel_events.get(job_id)
@@ -210,52 +243,86 @@ class JobStore:
         self,
         job_id: str,
         *,
-        cancelled: bool,
         response: Optional[dict[str, Any]] = None,
         response_status: Optional[int] = None,
         error: Optional[dict[str, Any]] = None,
         attempts: Optional[int] = None,
-    ) -> bool:
-        """Finish a running job. Terminal rows are never overwritten.
+    ) -> Optional[str]:
+        """Finish a running job in one ``BEGIN IMMEDIATE`` transaction.
 
-        Returns True if this call wrote the terminal state, False if the job
-        had already been finalised by another path.
+        Cancellation priority is decided *inside* the transaction: if a
+        cancel request committed first while the row was still ``running``,
+        ``cancel_requested`` is 1 here and the terminal state is written as
+        ``cancelled`` with ``response``, ``response_status`` and ``error``
+        all forced to NULL -- even when the runner returned a result after
+        its last cooperative cancel check.  Otherwise the supplied result is
+        written as ``succeeded`` or ``failed``.
+
+        Returns the terminal status written by this call
+        (``cancelled``/``succeeded``/``failed``), or ``None`` if the row was
+        already terminal.  Terminal rows are never overwritten.
         """
-        new_status = CANCELLED if cancelled else (
-            FAILED if error is not None else SUCCEEDED
-        )
-        # A cancelled job carries no final response, even if the runner
-        # happened to finish in the same instant the flag was set.
-        if cancelled:
-            response = None
-            response_status = None
-        with self._lock, self._conn:
-            cur = self._conn.execute(
-                "UPDATE jobs"
-                " SET status = ?, response = COALESCE(?, response),"
-                "     response_status = COALESCE(?, response_status),"
-                "     error = ?, attempts = COALESCE(?, attempts),"
-                "     finished_at = ?"
-                " WHERE id = ? AND status = ?",
-                (
-                    new_status,
-                    None if response is None else json.dumps(response, ensure_ascii=False),
-                    response_status,
-                    None if error is None else json.dumps(error, ensure_ascii=False),
-                    attempts,
-                    _utcnow(),
-                    job_id,
-                    RUNNING,
-                ),
-            )
-            finalised = cur.rowcount > 0
-            if not finalised:
-                status = self.get_status(job_id)
-                if status == CANCELLED:
-                    return True
-                return False
+        finished_at = _utcnow()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT cancel_requested FROM jobs"
+                    " WHERE id = ? AND status = ?",
+                    (job_id, RUNNING),
+                ).fetchone()
+                if row is None:
+                    # Already terminal (or gone): never overwrite.
+                    self._conn.execute("COMMIT")
+                    written: Optional[str] = None
+                elif row["cancel_requested"]:
+                    # The cancel txn committed first. Write the terminal
+                    # state and clear every result column in this same txn,
+                    # so no response/error can ever be observed on a
+                    # cancelled job, regardless of what the runner returned.
+                    self._conn.execute(
+                        "UPDATE jobs"
+                        " SET status = ?, response = NULL,"
+                        "     response_status = NULL, error = NULL,"
+                        "     attempts = COALESCE(?, attempts),"
+                        "     finished_at = ?"
+                        " WHERE id = ? AND status = ?",
+                        (CANCELLED, attempts, finished_at, job_id, RUNNING),
+                    )
+                    self._conn.execute("COMMIT")
+                    written = CANCELLED
+                else:
+                    new_status = FAILED if error is not None else SUCCEEDED
+                    self._conn.execute(
+                        "UPDATE jobs"
+                        " SET status = ?, response = COALESCE(?, response),"
+                        "     response_status = COALESCE(?, response_status),"
+                        "     error = ?, attempts = COALESCE(?, attempts),"
+                        "     finished_at = ?"
+                        " WHERE id = ? AND status = ?",
+                        (
+                            new_status,
+                            None
+                            if response is None
+                            else json.dumps(response, ensure_ascii=False),
+                            response_status,
+                            None
+                            if error is None
+                            else json.dumps(error, ensure_ascii=False),
+                            attempts,
+                            finished_at,
+                            job_id,
+                            RUNNING,
+                        ),
+                    )
+                    self._conn.execute("COMMIT")
+                    written = new_status
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        if written is not None:
             self._cancel_events.pop(job_id, None)
-            return True
+        return written
 
     def requeue_stale_running(self) -> int:
         """At startup, hand interrupted work back to the queue.
@@ -383,9 +450,10 @@ class JobWorker:
     def _process(self, job: dict[str, Any]) -> None:
         job_id = job["id"]
         # A DELETE may have raced the claim transaction; honour it before
-        # spending any work.
+        # spending any work. This is only an optimisation: finalize()
+        # re-checks the persisted flag inside its own transaction.
         if self._store.is_cancel_requested(job_id):
-            self._store.finalize(job_id, cancelled=True)
+            self._store.finalize(job_id)
             return
         event = self._store.bind_cancel_event(job_id)
         cancelled_attempts: Optional[int] = None
@@ -397,15 +465,22 @@ class JobWorker:
             cancelled_attempts = exc.attempts
             body, status_code, error, attempts = None, None, None, exc.attempts
         except BaseException as exc:  # pragma: no cover - defensive
+            # Whether this becomes failed or cancelled is decided inside the
+            # finalize transaction by the persisted cancel_requested flag, so
+            # a DELETE racing an unwinding runner still wins atomically.
             self._store.finalize(
                 job_id,
-                cancelled=self._store.is_cancel_requested(job_id),
                 error={"code": "internal_error", "message": repr(exc)},
             )
             return
+        # No pre-transaction cancel check here: the whole point of finalize()
+        # is that cancel priority is resolved against the committed flag in
+        # the same transaction that writes the terminal state. A cancel
+        # committed after the resolver's last boundary check therefore still
+        # yields cancelled (with no response/error), while a terminal state
+        # committed first survives and makes the later DELETE answer 409.
         self._store.finalize(
             job_id,
-            cancelled=event.is_set() or self._store.is_cancel_requested(job_id),
             response=body,
             response_status=status_code,
             error=error,
