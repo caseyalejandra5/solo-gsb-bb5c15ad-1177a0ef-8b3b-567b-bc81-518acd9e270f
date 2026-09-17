@@ -253,8 +253,10 @@ async def cancel_job(job_id: str, request: Request) -> JSONResponse:
     """Cancel a job.
 
     * queued    -> cancelled immediately (200)
-    * running   -> cancel requested; stops at the next candidate-evaluation
-                   boundary and becomes cancelled (202)
+    * running   -> cancel requested; the persisted flag wins over a late
+                   completion, so the job ends cancelled either at the next
+                   candidate-evaluation boundary or when the worker commits
+                   its result, whichever comes first (202)
     * cancelled -> idempotent no-op (200)
     * succeeded/failed -> 409, terminal state is preserved
     """

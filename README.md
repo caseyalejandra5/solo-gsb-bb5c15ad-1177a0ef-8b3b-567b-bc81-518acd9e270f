@@ -105,6 +105,21 @@ curl -s -X DELETE localhost:8000/jobs/{id}
 - **cancelled**：幂等，再次取消返回 `200`；
 - **succeeded / failed**：终态受保护，返回 `409`，原结果不会被覆盖。
 
+#### 取消与完成的线性化语义
+
+`DELETE`（在作业仍为 `running` 时持久化 `cancel_requested=1`）与 worker
+写回终态是**线性化**的：worker 的终结操作把"读取取消标志"和"写入终态"
+放在同一个 `BEGIN IMMEDIATE` 事务里完成，因此两种交错顺序都有确定结果——
+
+- **取消先提交**：即使解析器刚通过最后一次取消检查、worker 随后带着成功
+  或失败的结果提交，终态也原子地写为 `cancelled`，且不保留 `response`、
+  `response_status` 或 `error`；
+- **完成先提交**：随后的 `DELETE` 返回 `409`，已持久化的结果原样保留。
+
+换句话说，只要 `DELETE` 在作业仍为 `running` 时成功落库（返回 `202`），
+该作业最终一定是 `cancelled`：不存在"返回了 `202` 却最终 `succeeded`"
+或"已取消却仍带出响应体"的中间态。
+
 ### 崩溃恢复
 
 worker 以单条 `BEGIN IMMEDIATE` 事务原子领取最早的 `queued` 作业（按入队顺序，
@@ -269,7 +284,7 @@ pytest -q
 app/
   resolver.py    # PEP 440/508 解析、候选排序、回溯求解器、冲突数据结构、取消点
   serialize.py   # 冲突树 / 终态冲突的 JSON 序列化
-  jobs.py        # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
+  jobs.py        # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、单次事务终结（取消优先）、后台 worker
   main.py        # FastAPI 应用与 /resolve、/jobs、/health
 tests/           # 端到端 API 测试、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
 data/            # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）

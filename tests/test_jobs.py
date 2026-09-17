@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.jobs import QUEUED, RUNNING, JobStore
+from app.jobs import CANCELLED, QUEUED, RUNNING, SUCCEEDED, JobStore, JobWorker
 from app.main import app
 
 
@@ -185,8 +186,6 @@ def test_jobs_claimed_in_fifo_order(tmp_path):
 def test_claim_is_atomic_with_begin_immediate(tmp_path):
     # Many threads claiming concurrently: exactly one wins the job.  This is
     # the guarantee the BEGIN IMMEDIATE transaction provides.
-    import threading
-
     path = str(tmp_path / "a.db")
     s1 = JobStore(path)
     jid = s1.enqueue(SIMPLE)["id"]
@@ -316,3 +315,150 @@ def test_worker_runner_marks_cancelled_when_flag_set_mid_run(tmp_path):
     with pytest.raises(BaseException) as excinfo:
         run_resolution_job(slow_payload(), should_cancel)
     assert excinfo.value.attempts is not None
+
+
+# ---------------------------------------------------------------------------
+# Cancel vs. completion linearization
+#
+# These tests control the interleaving of DELETE and the worker's terminal
+# write deterministically with events (no sleeps): a gated store parks the
+# worker at the exact point where it commits the terminal state, so the
+# test chooses which side commits first.
+# ---------------------------------------------------------------------------
+
+
+class GatedJobStore(JobStore):
+    """JobStore test double that can hold ``finalize`` at the transaction
+    boundary, letting a test land a DELETE inside the commit window."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__(path)
+        self._gate_enabled = False
+        self.finalize_entered = threading.Event()
+        self.finalize_release = threading.Event()
+
+    def enable_finalize_gate(self) -> None:
+        self._gate_enabled = True
+
+    def finalize(self, job_id, **kwargs):
+        if self._gate_enabled:
+            self._gate_enabled = False  # one-shot
+            self.finalize_entered.set()
+            assert self.finalize_release.wait(timeout=5)
+        return super().finalize(job_id, **kwargs)
+
+
+def make_runner(outcome):
+    """A runner that has already passed its last cooperative cancel check
+    and completes with the given outcome."""
+
+    def runner(payload, should_cancel):
+        assert not should_cancel()
+        if outcome == "success":
+            return {"status": "ok", "resolved": {"x": "2.0"}}, 200, None, 1
+        if outcome == "failure":
+            return (
+                {"error": {"code": "invalid_request", "message": "boom"}},
+                400,
+                {"code": "invalid_request", "message": "boom"},
+                None,
+            )
+        raise RuntimeError("boom")
+
+    return runner
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "exception"])
+def test_cancel_committed_during_finalize_window_wins(tmp_path, outcome):
+    """Interleaving 1: DELETE persists cancel_requested while the job is
+    running, then the worker commits its (successful or failed) completion
+    without ever having seen the flag.  The terminal state must be written
+    atomically as cancelled, keeping no response or error."""
+    store = GatedJobStore(str(tmp_path / "race.db"))
+    jid = store.enqueue(SIMPLE)["id"]
+    job = store.claim_next()
+    assert job is not None
+
+    worker = JobWorker(store, make_runner(outcome))
+    store.enable_finalize_gate()
+    thread = threading.Thread(target=worker._process, args=(job,))
+    thread.start()
+    # The worker is parked at the terminal write; land the DELETE first.
+    assert store.finalize_entered.wait(timeout=5)
+    assert store.request_cancel(jid) == RUNNING
+    store.finalize_release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    final = store.get(jid)
+    assert final is not None
+    assert final["status"] == CANCELLED
+    assert final["cancel_requested"] is True
+    assert final["response"] is None
+    assert final["response_status"] is None
+    assert final["error"] is None
+    assert final["finished_at"] is not None
+    store.close()
+
+
+def test_completion_committed_before_delete_is_preserved(tmp_path):
+    """Interleaving 2: the worker's terminal write commits first; a DELETE
+    issued strictly after the commit keeps the result (the API maps this
+    outcome to 409)."""
+    store = JobStore(str(tmp_path / "race2.db"))
+    jid = store.enqueue(SIMPLE)["id"]
+    job = store.claim_next()
+    assert job is not None
+    committed = threading.Event()
+    cancel_outcome = []
+
+    def run_worker():
+        JobWorker(store, make_runner("success"))._process(job)
+        committed.set()
+
+    def run_delete():
+        # Deterministically ordered after the terminal commit.
+        assert committed.wait(timeout=5)
+        cancel_outcome.append(store.request_cancel(jid))
+
+    worker_thread = threading.Thread(target=run_worker)
+    delete_thread = threading.Thread(target=run_delete)
+    worker_thread.start()
+    delete_thread.start()
+    worker_thread.join(timeout=5)
+    delete_thread.join(timeout=5)
+    assert not worker_thread.is_alive() and not delete_thread.is_alive()
+
+    assert cancel_outcome == [SUCCEEDED]
+    final = store.get(jid)
+    assert final["status"] == SUCCEEDED
+    assert final["response"] == {"status": "ok", "resolved": {"x": "2.0"}}
+    assert final["response_status"] == 200
+    store.close()
+
+
+def test_delete_during_finalize_window_returns_202_then_job_cancelled(
+    tmp_path, monkeypatch
+):
+    """End to end: DELETE returns 202 while the worker is already
+    committing a successful result; the job still ends cancelled and the
+    API view carries no response or error."""
+    monkeypatch.setenv("RESOLVER_DB", str(tmp_path / "api-race.db"))
+    monkeypatch.setattr("app.main.JobStore", GatedJobStore)
+    with TestClient(app) as client:
+        store = app.state.job_store
+        assert isinstance(store, GatedJobStore)
+        store.enable_finalize_gate()
+        jid = client.post("/jobs", json=SIMPLE).json()["id"]
+        # The worker finished resolving and is parked at the commit.
+        assert store.finalize_entered.wait(timeout=5)
+        r = client.delete(f"/jobs/{jid}")
+        assert r.status_code == 202
+        assert r.json()["status"] == RUNNING
+        assert r.json()["cancel_requested"] is True
+        store.finalize_release.set()
+        job = wait_for(client, jid)
+    assert job["status"] == "cancelled"
+    assert "response" not in job
+    assert "response_status" not in job
+    assert "error" not in job
